@@ -1,0 +1,138 @@
+name: Launch Notebook
+
+on:
+  repository_dispatch:
+    types: [launch-notebook]
+  workflow_dispatch:
+    inputs:
+      gpu_type:
+        description: 'GPU type: p100 or t4x2'
+        required: false
+        default: 'p100'
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Kaggle CLI
+        run: pip install kaggle --quiet
+
+      - name: Authenticate Kaggle
+        run: |
+          mkdir -p ~/.kaggle
+          echo '{"username":"${{ secrets.KAGGLE_USERNAME }}","key":"${{ secrets.KAGGLE_KEY }}"}' \
+            > ~/.kaggle/kaggle.json
+          chmod 600 ~/.kaggle/kaggle.json
+
+      - name: Inject secrets into notebook metadata
+        run: |
+          GPU="${{ github.event.inputs.gpu_type || 'p100' }}"
+
+          # Patch kernel-metadata.json with correct GPU type
+          python3 - <<'PYEOF'
+          import json, os
+
+          gpu = os.environ.get('GPU_TYPE', 'p100')
+          accelerator = 'nvidiaTeslaT4' if 't4' in gpu else 'nvidiaTeslaP100'
+
+          meta = {
+            "id": "${{ secrets.KAGGLE_USERNAME }}/gpu-cloud-server",
+            "title": "gpu-cloud-server",
+            "code_file": "session_server.ipynb",
+            "language": "python",
+            "kernel_type": "notebook",
+            "is_private": True,
+            "enable_gpu": True,
+            "enable_internet": True,
+            "accelerator": accelerator,
+            "dataset_sources": [],
+            "competition_sources": [],
+            "kernel_sources": []
+          }
+          with open('kaggle/kernel-metadata.json', 'w') as f:
+              json.dump(meta, f, indent=2)
+          print(f"Metadata written, GPU: {accelerator}")
+          PYEOF
+        env:
+          GPU_TYPE: ${{ github.event.inputs.gpu_type || 'p100' }}
+
+      - name: Inject env secrets into notebook
+        run: |
+          python3 - <<'PYEOF'
+          import json
+
+          nb_path = 'kaggle/session_server.ipynb'
+          with open(nb_path) as f:
+              nb = json.load(f)
+
+          # Find the CONFIG cell and inject secrets
+          config_vars = {
+              'DB_HOST':        'sql312.infinityfree.com',
+              'DB_NAME':        'if0_41143060_gpu',
+              'DB_USER':        'if0_41143060',
+              'DB_PASS':        '${{ secrets.DB_PASSWORD }}',
+              'CF_TUNNEL_TOKEN':'${{ secrets.CF_TUNNEL_TOKEN }}',
+              'INTERNAL_TOKEN': '${{ secrets.INTERNAL_TOKEN }}',
+              'SITE_URL':       '${{ secrets.SITE_URL }}',
+          }
+
+          for cell in nb['cells']:
+              src = ''.join(cell.get('source', []))
+              if '# === INJECTED CONFIG ===' in src:
+                  lines = ['# === INJECTED CONFIG === (auto-filled by GitHub Actions)\n']
+                  for k, v in config_vars.items():
+                      lines.append(f'{k} = {json.dumps(v)}\n')
+                  cell['source'] = lines
+                  break
+
+          with open(nb_path, 'w') as f:
+              json.dump(nb, f, indent=1)
+          print("Config injected into notebook")
+          PYEOF
+
+      - name: Mark notebook as booting in DB
+        run: |
+          curl -s -X POST "${{ secrets.SITE_URL }}/queue.php" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"action\": \"set_notebook_status\",
+              \"internal_token\": \"${{ secrets.INTERNAL_TOKEN }}\",
+              \"status\": \"booting\"
+            }"
+
+      - name: Push notebook to Kaggle
+        run: |
+          kaggle kernels push -p ./kaggle
+          echo "Notebook pushed successfully"
+
+      - name: Wait for notebook to come online
+        run: |
+          KERNEL="${{ secrets.KAGGLE_USERNAME }}/gpu-cloud-server"
+          echo "Waiting for kernel $KERNEL to start..."
+
+          for i in $(seq 1 40); do
+            STATUS=$(kaggle kernels status $KERNEL 2>/dev/null | grep -oP '(?<=status )\S+' || echo "unknown")
+            echo "Attempt $i — status: $STATUS"
+
+            if [ "$STATUS" = "running" ]; then
+              echo "Kernel is running!"
+              break
+            elif [ "$STATUS" = "error" ]; then
+              echo "Kernel errored out"
+              # Update DB to offline
+              curl -s -X POST "${{ secrets.SITE_URL }}/queue.php" \
+                -H "Content-Type: application/json" \
+                -d "{\"action\":\"set_notebook_status\",\"internal_token\":\"${{ secrets.INTERNAL_TOKEN }}\",\"status\":\"offline\"}"
+              exit 1
+            fi
+            sleep 30
+          done
+
+      - name: Log successful launch
+        run: |
+          echo "Notebook launched successfully at $(date -u)"
+          # DB status will be updated by the notebook's own heartbeat

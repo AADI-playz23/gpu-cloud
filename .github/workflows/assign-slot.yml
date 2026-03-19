@@ -1,0 +1,29 @@
+name: Assign Slot
+
+on:
+  repository_dispatch:
+    types: [assign-slot]
+
+jobs:
+  assign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Notify Kaggle orchestrator of new assignment
+        run: |
+          SLOT_ID="${{ github.event.client_payload.slot_id }}"
+          USER_ID="${{ github.event.client_payload.user_id }}"
+
+          echo "Assigning slot $SLOT_ID to user $USER_ID"
+
+          # Write assignment to DB so Kaggle orchestrator picks it up on next poll
+          curl -s -X POST "${{ secrets.SITE_URL }}/queue.php" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"action\": \"queue_assignment\",
+              \"internal_token\": \"${{ secrets.INTERNAL_TOKEN }}\",
+              \"slot_id\": $SLOT_ID,
+              \"user_id\": \"$USER_ID\"
+            }"
+
+          echo "Assignment dispatched"
