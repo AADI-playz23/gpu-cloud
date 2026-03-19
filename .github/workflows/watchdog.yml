@@ -2,15 +2,15 @@ name: Watchdog
 
 on:
   schedule:
-    - cron: '*/5 * * * *'     # every 5 minutes
-  workflow_dispatch:            # manual trigger for testing
+    - cron: '* * * * *'
+  workflow_dispatch:
 
 jobs:
   watchdog:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Check expired sessions and quota
+      - name: Poll DB for new queue entries and expired sessions
         run: |
           echo "=== Watchdog tick $(date -u) ==="
 
@@ -21,25 +21,92 @@ jobs:
               \"internal_token\": \"${{ secrets.INTERNAL_TOKEN }}\"
             }")
 
-          echo "Watchdog response: $RESPONSE"
+          echo "Response: $RESPONSE"
 
-          FREED=$(echo $RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin).get('freed_slots',[]))")
-          echo "Freed slots: $FREED"
+          # Check if any slots need to be assigned
+          ASSIGNMENTS=$(echo $RESPONSE | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    assignments = d.get('new_assignments', [])
+    for a in assignments:
+        print(f\"{a['slot_id']}:{a['user_id']}\")
+except:
+    pass
+" 2>/dev/null || true)
 
-          # For each freed slot, trigger slot-freed workflow
-          echo $RESPONSE | python3 -c "
-          import sys, json, subprocess
-          d = json.load(sys.stdin)
-          for slot_id in d.get('freed_slots', []):
-              print(f'Triggering slot-freed for slot {slot_id}')
-          " || true
+          # Trigger assign-slot for each new assignment
+          for ENTRY in $ASSIGNMENTS; do
+            SLOT_ID=$(echo $ENTRY | cut -d: -f1)
+            USER_ID=$(echo $ENTRY | cut -d: -f2)
+            echo "Assigning slot $SLOT_ID to user $USER_ID"
 
-  # ── Separate job: notebook auto-start scheduler ─────────────
+            curl -s -X POST \
+              -H "Authorization: token ${{ secrets.GH_PAT }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              https://api.github.com/repos/AADI-playz23/gpu-cloud/dispatches \
+              -d "{
+                \"event_type\": \"assign-slot\",
+                \"client_payload\": {
+                  \"slot_id\": $SLOT_ID,
+                  \"user_id\": \"$USER_ID\"
+                }
+              }"
+          done
+
+          # Check freed slots and promote next user
+          FREED=$(echo $RESPONSE | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    for s in d.get('freed_slots', []):
+        print(s)
+except:
+    pass
+" 2>/dev/null || true)
+
+          for SLOT_ID in $FREED; do
+            echo "Slot $SLOT_ID was freed — promoting next user"
+
+            NEXT=$(curl -s -X POST "${{ secrets.SITE_URL }}/queue.php" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"action\": \"get_next_queued\",
+                \"internal_token\": \"${{ secrets.INTERNAL_TOKEN }}\",
+                \"slot_id\": $SLOT_ID
+              }")
+
+            NEXT_USER=$(echo $NEXT | python3 -c "
+import sys, json
+try:
+    print(json.load(sys.stdin).get('user_id',''))
+except:
+    print('')
+" 2>/dev/null || true)
+
+            if [ -n "$NEXT_USER" ] && [ "$NEXT_USER" != "null" ] && [ "$NEXT_USER" != "" ]; then
+              echo "Promoting $NEXT_USER to slot $SLOT_ID"
+              curl -s -X POST \
+                -H "Authorization: token ${{ secrets.GH_PAT }}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                https://api.github.com/repos/AADI-playz23/gpu-cloud/dispatches \
+                -d "{
+                  \"event_type\": \"assign-slot\",
+                  \"client_payload\": {
+                    \"slot_id\": $SLOT_ID,
+                    \"user_id\": \"$NEXT_USER\"
+                  }
+                }"
+            else
+              echo "Queue empty — slot $SLOT_ID stays free"
+            fi
+          done
+
   notebook-scheduler:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Check if notebook should start
+      - name: Check if notebook should auto-start
         run: |
           RESPONSE=$(curl -s -X POST "${{ secrets.SITE_URL }}/queue.php" \
             -H "Content-Type: application/json" \
@@ -48,14 +115,24 @@ jobs:
               \"internal_token\": \"${{ secrets.INTERNAL_TOKEN }}\"
             }")
 
-          SHOULD_START=$(echo $RESPONSE | python3 -c "import sys,json; print(json.load(sys.stdin).get('should_start', False))")
-          echo "Should start notebook: $SHOULD_START"
+          echo "Scheduler check: $RESPONSE"
 
-          if [ "$SHOULD_START" = "True" ]; then
-            echo "Triggering notebook boot..."
+          SHOULD=$(echo $RESPONSE | python3 -c "
+import sys, json
+try:
+    print(str(json.load(sys.stdin).get('should_start', False)).lower())
+except:
+    print('false')
+" 2>/dev/null || true)
+
+          echo "Should start: $SHOULD"
+
+          if [ "$SHOULD" = "true" ]; then
+            echo "Triggering notebook launch..."
             curl -s -X POST \
               -H "Authorization: token ${{ secrets.GH_PAT }}" \
               -H "Accept: application/vnd.github.v3+json" \
               https://api.github.com/repos/AADI-playz23/gpu-cloud/dispatches \
-              -d '{"event_type": "launch-notebook"}'
+              -d '{"event_type":"launch-notebook","client_payload":{"gpu_type":"p100"}}'
+            echo "Launch triggered"
           fi
