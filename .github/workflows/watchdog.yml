@@ -28,9 +28,8 @@ jobs:
 import sys, json
 try:
     d = json.load(sys.stdin)
-    assignments = d.get('new_assignments', [])
-    for a in assignments:
-        print(f\"{a['slot_id']}:{a['user_id']}\")
+    for a in d.get('new_assignments', []):
+        print(str(a['slot_id']) + ':' + str(a['user_id']))
 except:
     pass
 " 2>/dev/null || true)
