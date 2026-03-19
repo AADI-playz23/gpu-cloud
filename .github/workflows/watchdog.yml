@@ -10,92 +10,66 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Poll DB for new queue entries and expired sessions
+      - name: Poll DB and process queue
         run: |
           echo "=== Watchdog tick $(date -u) ==="
 
           RESPONSE=$(curl -s -X POST "${{ secrets.SITE_URL }}/queue.php" \
             -H "Content-Type: application/json" \
-            -d "{
-              \"action\": \"watchdog_tick\",
-              \"internal_token\": \"${{ secrets.INTERNAL_TOKEN }}\"
-            }")
+            -d "{\"action\":\"watchdog_tick\",\"internal_token\":\"${{ secrets.INTERNAL_TOKEN }}\"}")
 
           echo "Response: $RESPONSE"
 
-          # Check if any slots need to be assigned
-          ASSIGNMENTS=$(echo $RESPONSE | python3 -c "
+          cat > /tmp/parse_assignments.py << 'PYEOF'
 import sys, json
-try:
-    d = json.load(sys.stdin)
-    for a in d.get('new_assignments', []):
-        print(str(a['slot_id']) + ':' + str(a['user_id']))
-except:
-    pass
-" 2>/dev/null || true)
+data = json.loads(sys.stdin.read())
+for a in data.get("new_assignments", []):
+    print(str(a["slot_id"]) + ":" + str(a["user_id"]))
+PYEOF
 
-          # Trigger assign-slot for each new assignment
+          cat > /tmp/parse_freed.py << 'PYEOF'
+import sys, json
+data = json.loads(sys.stdin.read())
+for s in data.get("freed_slots", []):
+    print(s)
+PYEOF
+
+          cat > /tmp/parse_next.py << 'PYEOF'
+import sys, json
+data = json.loads(sys.stdin.read())
+print(data.get("user_id") or "")
+PYEOF
+
+          ASSIGNMENTS=$(echo "$RESPONSE" | python3 /tmp/parse_assignments.py 2>/dev/null || true)
+
           for ENTRY in $ASSIGNMENTS; do
-            SLOT_ID=$(echo $ENTRY | cut -d: -f1)
-            USER_ID=$(echo $ENTRY | cut -d: -f2)
+            SLOT_ID=$(echo "$ENTRY" | cut -d: -f1)
+            USER_ID=$(echo "$ENTRY" | cut -d: -f2)
             echo "Assigning slot $SLOT_ID to user $USER_ID"
-
             curl -s -X POST \
               -H "Authorization: token ${{ secrets.GH_PAT }}" \
               -H "Accept: application/vnd.github.v3+json" \
               https://api.github.com/repos/AADI-playz23/gpu-cloud/dispatches \
-              -d "{
-                \"event_type\": \"assign-slot\",
-                \"client_payload\": {
-                  \"slot_id\": $SLOT_ID,
-                  \"user_id\": \"$USER_ID\"
-                }
-              }"
+              -d "{\"event_type\":\"assign-slot\",\"client_payload\":{\"slot_id\":$SLOT_ID,\"user_id\":\"$USER_ID\"}}"
           done
 
-          # Check freed slots and promote next user
-          FREED=$(echo $RESPONSE | python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    for s in d.get('freed_slots', []):
-        print(s)
-except:
-    pass
-" 2>/dev/null || true)
+          FREED=$(echo "$RESPONSE" | python3 /tmp/parse_freed.py 2>/dev/null || true)
 
           for SLOT_ID in $FREED; do
-            echo "Slot $SLOT_ID was freed — promoting next user"
-
+            echo "Slot $SLOT_ID freed — checking queue"
             NEXT=$(curl -s -X POST "${{ secrets.SITE_URL }}/queue.php" \
               -H "Content-Type: application/json" \
-              -d "{
-                \"action\": \"get_next_queued\",
-                \"internal_token\": \"${{ secrets.INTERNAL_TOKEN }}\",
-                \"slot_id\": $SLOT_ID
-              }")
+              -d "{\"action\":\"get_next_queued\",\"internal_token\":\"${{ secrets.INTERNAL_TOKEN }}\",\"slot_id\":$SLOT_ID}")
 
-            NEXT_USER=$(echo $NEXT | python3 -c "
-import sys, json
-try:
-    print(json.load(sys.stdin).get('user_id',''))
-except:
-    print('')
-" 2>/dev/null || true)
+            NEXT_USER=$(echo "$NEXT" | python3 /tmp/parse_next.py 2>/dev/null || true)
 
-            if [ -n "$NEXT_USER" ] && [ "$NEXT_USER" != "null" ] && [ "$NEXT_USER" != "" ]; then
+            if [ -n "$NEXT_USER" ] && [ "$NEXT_USER" != "null" ]; then
               echo "Promoting $NEXT_USER to slot $SLOT_ID"
               curl -s -X POST \
                 -H "Authorization: token ${{ secrets.GH_PAT }}" \
                 -H "Accept: application/vnd.github.v3+json" \
                 https://api.github.com/repos/AADI-playz23/gpu-cloud/dispatches \
-                -d "{
-                  \"event_type\": \"assign-slot\",
-                  \"client_payload\": {
-                    \"slot_id\": $SLOT_ID,
-                    \"user_id\": \"$NEXT_USER\"
-                  }
-                }"
+                -d "{\"event_type\":\"assign-slot\",\"client_payload\":{\"slot_id\":$SLOT_ID,\"user_id\":\"$NEXT_USER\"}}"
             else
               echo "Queue empty — slot $SLOT_ID stays free"
             fi
@@ -109,21 +83,17 @@ except:
         run: |
           RESPONSE=$(curl -s -X POST "${{ secrets.SITE_URL }}/queue.php" \
             -H "Content-Type: application/json" \
-            -d "{
-              \"action\": \"should_start_notebook\",
-              \"internal_token\": \"${{ secrets.INTERNAL_TOKEN }}\"
-            }")
+            -d "{\"action\":\"should_start_notebook\",\"internal_token\":\"${{ secrets.INTERNAL_TOKEN }}\"}")
 
           echo "Scheduler check: $RESPONSE"
 
-          SHOULD=$(echo $RESPONSE | python3 -c "
+          cat > /tmp/parse_should.py << 'PYEOF'
 import sys, json
-try:
-    print(str(json.load(sys.stdin).get('should_start', False)).lower())
-except:
-    print('false')
-" 2>/dev/null || true)
+data = json.loads(sys.stdin.read())
+print("true" if data.get("should_start") else "false")
+PYEOF
 
+          SHOULD=$(echo "$RESPONSE" | python3 /tmp/parse_should.py 2>/dev/null || true)
           echo "Should start: $SHOULD"
 
           if [ "$SHOULD" = "true" ]; then
@@ -132,6 +102,5 @@ except:
               -H "Authorization: token ${{ secrets.GH_PAT }}" \
               -H "Accept: application/vnd.github.v3+json" \
               https://api.github.com/repos/AADI-playz23/gpu-cloud/dispatches \
-              -d '{"event_type":"launch-notebook","client_payload":{"gpu_type":"p100"}}'
-            echo "Launch triggered"
+              -d "{\"event_type\":\"launch-notebook\",\"client_payload\":{\"gpu_type\":\"p100\"}}"
           fi
