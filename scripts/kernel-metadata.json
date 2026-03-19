@@ -1,0 +1,14 @@
+{
+  "id": "KAGGLE_USERNAME_PLACEHOLDER/gpu-cloud-server",
+  "title": "gpu-cloud-server",
+  "code_file": "session_server.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "accelerator": "nvidiaTeslaP100",
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": []
+}
